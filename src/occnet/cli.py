@@ -33,10 +33,29 @@ def _load_config(path: Optional[Path]):
 
 
 _ALL_OPT = typer.Option(False, "--all", "-a", help="Use every camera found, ignoring the config's list")
+_ONLY_OPT = typer.Option(
+    None, "--only", help="Comma-separated camera names to keep, e.g. --only iphone"
+)
+
+
+def _filter_names(res, only_names: Optional[str]):
+    """Narrow a resolution to a chosen subset of cameras."""
+    if not only_names:
+        return res
+    wanted = [n.strip() for n in only_names.split(",") if n.strip()]
+    missing = [n for n in wanted if n not in res.resolved]
+    if missing:
+        console.print(
+            f"[red]--only names not found:[/red] {', '.join(missing)}  "
+            f"(available: {', '.join(res.resolved) or 'none'})"
+        )
+        raise typer.Exit(1)
+    res.resolved = {n: res.resolved[n] for n in wanted}
+    return res
 
 
 def _resolve_rig(cfg, require_all: bool = True, only: Optional[dict] = None,
-                 discover: bool = False):
+                 discover: bool = False, only_names: Optional[str] = None):
     """Map configured camera names to plugged-in devices, or explain what's missing."""
     from .devices import RigResolution, discover_all, resolve_rig
 
@@ -45,7 +64,9 @@ def _resolve_rig(cfg, require_all: bool = True, only: Optional[dict] = None,
         if not found:
             console.print("[red]No usable cameras found.[/red]")
             raise typer.Exit(1)
-        return RigResolution(resolved=found, available=list(found.values()))
+        return _filter_names(
+            RigResolution(resolved=found, available=list(found.values())), only_names
+        )
 
     res = resolve_rig(only if only is not None else cfg.cameras)
     if res.missing and require_all:
@@ -59,7 +80,7 @@ def _resolve_rig(cfg, require_all: bool = True, only: Optional[dict] = None,
             "(needs firmware 1.2.7+). Plain USB/file-transfer mode does not expose a camera."
         )
         raise typer.Exit(1)
-    return res
+    return _filter_names(res, only_names)
 
 
 @app.command()
@@ -238,6 +259,7 @@ def init(
 def preview(
     config: Optional[Path] = _CONFIG_OPT,
     all_cameras: bool = _ALL_OPT,
+    only: Optional[str] = _ONLY_OPT,
     height: int = typer.Option(540, "--height", help="Tile height in the window"),
 ) -> None:
     """Show every configured camera live, side by side."""
@@ -245,7 +267,7 @@ def preview(
     from .viewer import run_viewer
 
     cfg = _load_config(config)
-    res = _resolve_rig(cfg, discover=all_cameras)
+    res = _resolve_rig(cfg, discover=all_cameras, only_names=only)
     for name, dev in res.resolved.items():
         console.print(f"  {name} -> {dev}")
 
@@ -500,6 +522,7 @@ def _load_rig_calibration(cfg, sizes: dict[str, tuple[int, int]], reference: Opt
 def live(
     config: Optional[Path] = _CONFIG_OPT,
     all_cameras: bool = _ALL_OPT,
+    only: Optional[str] = _ONLY_OPT,
     mode: str = typer.Option("mono", "--mode", help="mono | stereo | both"),
     stride: int = typer.Option(3, "--stride", help="Pixel stride when lifting depth"),
     show_points: bool = typer.Option(True, "--points/--no-points"),
@@ -515,7 +538,7 @@ def live(
     from .viz.rerun_viz import RerunViz, height_colors
 
     cfg = _load_config(config)
-    res = _resolve_rig(cfg, discover=all_cameras)
+    res = _resolve_rig(cfg, discover=all_cameras, only_names=only)
     rig_cams = CameraRig(res.resolved, cfg.capture)
 
     with rig_cams:
@@ -590,6 +613,7 @@ def live(
 def watch(
     config: Optional[Path] = _CONFIG_OPT,
     all_cameras: bool = _ALL_OPT,
+    only: Optional[str] = _ONLY_OPT,
     alert_m: Optional[float] = typer.Option(None, "--alert", help="Tint anything closer than this, in metres"),
     stride: int = typer.Option(3, "--stride", help="Pixel stride when lifting depth"),
     carve_stride: int = typer.Option(4, "--carve-stride"),
@@ -620,7 +644,7 @@ def watch(
     from .overlay import caption, render_inference_view
 
     cfg = _load_config(config)
-    res = _resolve_rig(cfg, discover=all_cameras)
+    res = _resolve_rig(cfg, discover=all_cameras, only_names=only)
     for name, dev in res.resolved.items():
         console.print(f"  {name} -> {dev}")
 
