@@ -501,6 +501,187 @@ def live(
 
 
 @app.command()
+def watch(
+    config: Optional[Path] = _CONFIG_OPT,
+    alert_m: Optional[float] = typer.Option(None, "--alert", help="Tint anything closer than this, in metres"),
+    stride: int = typer.Option(3, "--stride", help="Pixel stride when lifting depth"),
+    carve_stride: int = typer.Option(4, "--carve-stride"),
+    row_height: int = typer.Option(300, "--row-height"),
+    decay: float = typer.Option(0.92, "--decay", help="Per-frame evidence decay; 1.0 accumulates forever"),
+    auto_range: bool = typer.Option(True, "--auto-range/--fixed-range"),
+    out: Optional[Path] = typer.Option(None, "--out", "-o", help="Also record the view to an mp4"),
+    window: bool = typer.Option(True, "--window/--no-window"),
+) -> None:
+    """Live inference on every camera at once, with a shared occupancy map.
+
+    Each camera gets a row of [frame + near-field alert | metric depth], and the
+    fused top-down occupancy map sits alongside. This is `live` without the
+    Rerun 3D viewer — one window, aimed at watching both cameras infer on the
+    same scene.
+    """
+    import cv2
+    import numpy as np
+
+    from .capture import CameraRig
+    from .depth.mono import MonoDepth
+    from .fusion.grid import GridConfig, OccupancyGrid, fit_bounds
+    from .fusion.lift import lift_depth
+    from .geometry import transform_points
+    from .overlay import caption, render_inference_view
+
+    cfg = _load_config(config)
+    res = _resolve_rig(cfg)
+    for name, dev in res.resolved.items():
+        console.print(f"  {name} -> {dev}")
+
+    rig_cams = CameraRig(res.resolved, cfg.capture)
+    with rig_cams:
+        sizes = rig_cams.sizes()
+        console.print(f"sizes : {sizes}")
+        rig_calib, calibrated = _load_rig_calibration(cfg, sizes)
+
+        # Without solved extrinsics every camera sits at the identity, so fusing
+        # them all would stack unrelated clouds on top of each other and claim
+        # they agree. Fuse only the reference camera until `calib stereo` runs.
+        has_extrinsics = cfg.rig_path.exists() and any(
+            np.any(rig_calib.T_rig_cam(n)[:3, 3]) for n in sizes if n != cfg.reference
+        )
+        fuse_from = list(sizes) if has_extrinsics else [cfg.reference]
+        bev_note = "" if has_extrinsics else "single-camera (no extrinsics)"
+        if not has_extrinsics:
+            console.print(
+                "[yellow]No rig extrinsics — the occupancy map is built from "
+                f"'{cfg.reference}' alone. Both depth panels are still live. "
+                "Run `occnet calib stereo` to fuse both.[/yellow]"
+            )
+
+        depth_model = MonoDepth(cfg.mono)
+        console.print(f"model : {depth_model.repo}")
+        depth_model.load()
+
+        grid_cfg = GridConfig(**{**asdict(cfg.grid), "carve_stride": carve_stride})
+        if auto_range:
+            first = rig_cams.read(timeout=8.0)
+            if first is None:
+                console.print("[red]no frames from the rig[/red]")
+                raise typer.Exit(1)
+            ref_cam = rig_calib.cameras[cfg.reference]
+            try:
+                lo, hi, voxel = fit_bounds(
+                    depth_model(first[cfg.reference].image), ref_cam.hfov_deg, ref_cam.vfov_deg
+                )
+                grid_cfg = GridConfig(**{
+                    **asdict(grid_cfg),
+                    "bounds_min": lo, "bounds_max": hi, "voxel_size": voxel,
+                    "max_ray_m": float(np.linalg.norm(np.array(hi) - np.array(lo))),
+                })
+                console.print(f"range : auto-fitted to {lo[2]:.1f}-{hi[2]:.1f} m, voxel {voxel * 100:.1f} cm")
+            except ValueError as exc:
+                console.print(f"[yellow]auto-range failed ({exc}); using the config's grid[/yellow]")
+
+        if alert_m is None:
+            alert_m = grid_cfg.bounds_min[2] + 0.25 * (grid_cfg.bounds_max[2] - grid_cfg.bounds_min[2])
+            console.print(f"alert : auto-set to {alert_m:.2f} m")
+
+        grid = OccupancyGrid(grid_cfg)
+        console.print(f"grid  : {grid.shape} @ {grid_cfg.voxel_size * 100:.1f} cm on {grid.device}")
+
+        if window:
+            cv2.namedWindow("occnet — live inference", cv2.WINDOW_NORMAL)
+        console.print("[dim]q quit · s snapshot · r reset grid[/dim]")
+
+        writer = None
+        n = 0
+        ms_ema = 0.0
+        try:
+            while True:
+                frames = rig_cams.read(timeout=5.0)
+                if frames is None:
+                    console.print("[yellow]camera stalled[/yellow]")
+                    break
+
+                t0 = time.perf_counter()
+                panels: list[tuple[str, np.ndarray, np.ndarray]] = []
+                total_pts = 0
+                if decay < 1.0:
+                    grid.decay(decay)
+                for name in sizes:
+                    frame = frames[name]
+                    depth = depth_model(frame.image)
+                    panels.append((name, frame.image, depth))
+                    if name not in fuse_from:
+                        continue
+                    pts, _ = lift_depth(
+                        depth, rig_calib.cameras[name], None, stride=stride,
+                        max_depth_m=cfg.mono.max_depth_m, min_depth_m=cfg.mono.min_depth_m,
+                    )
+                    if len(pts) == 0:
+                        continue
+                    T = rig_calib.T_rig_cam(name)
+                    grid.integrate(transform_points(T, pts).astype(np.float32), T[:3, 3])
+                    total_pts += len(pts)
+
+                elapsed = (time.perf_counter() - t0) * 1000
+                ms_ema = elapsed if not ms_ema else 0.9 * ms_ema + 0.1 * elapsed
+
+                canvas = render_inference_view(
+                    panels, grid.bev(), grid_cfg.voxel_size,
+                    grid_cfg.bounds_min, grid_cfg.bounds_max,
+                    alert_m=alert_m, row_height=row_height, bev_note=bev_note,
+                )
+                stats = grid.stats()
+                caption(canvas, [
+                    f"{1000 / ms_ema:5.1f} fps   step {ms_ema:5.1f} ms   skew {rig_cams.stats.skew_ms:4.1f} ms",
+                    f"pts {total_pts:6d}   occupied {int(stats['occupied']):6d}   q quit  s snap  r reset",
+                ], origin=(10, canvas.shape[0] - 60))
+
+                if out is not None:
+                    if writer is None:
+                        out.parent.mkdir(parents=True, exist_ok=True)
+                        writer = cv2.VideoWriter(
+                            str(out), cv2.VideoWriter_fourcc(*"mp4v"), 15.0,
+                            (canvas.shape[1], canvas.shape[0]),
+                        )
+                    writer.write(canvas)
+
+                if window:
+                    cv2.imshow("occnet — live inference", canvas)
+                    key = cv2.waitKey(1) & 0xFF
+                    if key in (ord("q"), 27):
+                        break
+                    if key == ord("r"):
+                        grid.reset()
+                        console.print("grid reset")
+                    if key == ord("s"):
+                        snap = Path("out/snapshots")
+                        snap.mkdir(parents=True, exist_ok=True)
+                        path = snap / f"watch-{time.strftime('%Y%m%d-%H%M%S')}.png"
+                        cv2.imwrite(str(path), canvas)
+                        console.print(f"saved {path}")
+
+                if n % 30 == 0:
+                    console.print(
+                        f"  frame {n:5d} · {elapsed:6.1f} ms · depth {depth_model.last_ms:5.1f} ms · "
+                        f"occupied {int(stats['occupied']):6d}"
+                    )
+                n += 1
+        except KeyboardInterrupt:
+            console.print("\nstopping…")
+        finally:
+            if writer is not None:
+                writer.release()
+            if window:
+                cv2.destroyAllWindows()
+                for _ in range(5):
+                    cv2.waitKey(1)
+
+    if ms_ema:
+        console.print(f"[green]{n} frames at {1000 / ms_ema:.1f} fps average[/green]")
+    if out is not None:
+        console.print(f"[green]wrote {out}[/green]")
+
+
+@app.command()
 def play(
     video: Optional[Path] = typer.Argument(None, help="Video file; omitted renders a synthetic test clip"),
     config: Optional[Path] = _CONFIG_OPT,

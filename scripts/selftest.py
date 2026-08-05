@@ -242,8 +242,49 @@ def test_fusion() -> None:
         check("grid survives a save/load round-trip", same and reloaded.shape == grid.shape)
 
 
+def test_overlay() -> None:
+    print("\n[4] inference overlay rendering")
+    from occnet.fusion.grid import fit_bounds
+    from occnet.overlay import near_field_mask, render_inference_view
+
+    cam = CameraModel.guess("virt", 640, 360, hfov_deg=80.0)
+    depth = synthetic_room(cam, np.eye(4))
+    image = np.full((360, 640, 3), 90, np.uint8)
+
+    lo, hi, voxel = fit_bounds(depth, cam.hfov_deg, cam.vfov_deg)
+    check("fit_bounds covers the observed depth", hi[2] > float(depth[depth > 0].max()) * 0.9,
+          f"z up to {hi[2]:.2f} m, voxel {voxel * 100:.1f} cm")
+    n_vox = np.prod(np.ceil((np.array(hi) - np.array(lo)) / voxel))
+    check("fit_bounds respects the voxel budget", n_vox <= 3_000_000 * 1.5, f"{n_vox / 1e6:.2f} M voxels")
+
+    # The slab sits at 1.6 m, so a 2 m alert must mark pixels and a 0.5 m one must not.
+    hot = near_field_mask(image, depth, 2.0)
+    cold = near_field_mask(image, depth, 0.5)
+    check("near-field alert marks close surfaces", not np.array_equal(hot, image))
+    check("near-field alert ignores distant surfaces", np.array_equal(cold, image))
+
+    grid = OccupancyGrid(
+        GridConfig(voxel_size=0.05, bounds_min=(-2.0, -1.5, 0.0), bounds_max=(2.0, 1.5, 3.5), device="cpu")
+    )
+    pts, _ = lift_depth(depth, cam, None, stride=3, max_depth_m=6.0)
+    grid.integrate(pts, np.zeros(3))
+
+    bev = grid.bev()
+    check("bev collapses to a 2D map", bev.ndim == 2 and bev.shape == (grid.shape[2], grid.shape[0]),
+          f"{bev.shape}")
+    check("bev shows occupancy", float(bev.max()) > 0.65, f"max p = {bev.max():.2f}")
+
+    canvas = render_inference_view(
+        [("cam0", image, depth), ("cam1", image, depth)],
+        bev, 0.05, (-2.0, -1.5, 0.0), (2.0, 1.5, 3.5), alert_m=2.0, row_height=240,
+    )
+    # Two rows of [rgb | depth] plus a square BEV column on the right.
+    check("inference view composes two camera rows", canvas.shape[0] == 480, f"{canvas.shape}")
+    check("inference view is not blank", int(canvas.max()) > 0 and float(canvas.std()) > 5)
+
+
 def test_config() -> None:
-    print("\n[4] configuration round-trip")
+    print("\n[5] configuration round-trip")
     import tempfile
 
     for name in ("configs/rig.yaml", "configs/rig-builtin.yaml"):
@@ -268,6 +309,7 @@ def main() -> int:
     if truth is not None:
         test_extrinsics(spec, truth)
     test_fusion()
+    test_overlay()
     test_config()
 
     print(f"\n{len(PASSES)} passed, {len(FAILS)} failed")

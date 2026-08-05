@@ -114,6 +114,62 @@ def bev_panel(
     return img
 
 
+def render_inference_view(
+    per_camera: list[tuple[str, np.ndarray, np.ndarray]],
+    bev: np.ndarray | None,
+    voxel_size: float,
+    bounds_min: tuple[float, float, float],
+    bounds_max: tuple[float, float, float],
+    alert_m: float,
+    row_height: int = 300,
+    bev_note: str = "",
+) -> np.ndarray:
+    """Lay out a multi-camera inference view.
+
+    ``per_camera`` is a list of ``(name, bgr_image, metric_depth)``. Each camera
+    gets a row of [frame with near-field alert | depth], and the shared
+    occupancy BEV is stacked on the right at the full height of those rows.
+
+    Pure function of its inputs — no capture, no model — so the layout can be
+    exercised without hardware.
+    """
+    max_depth = float(bounds_max[2])
+    rows = []
+    for name, image, depth in per_camera:
+        rgb = near_field_mask(image, depth, alert_m)
+        valid = depth[depth > 0]
+        caption(rgb, [name, f"alert < {alert_m:.2f} m"])
+        dpanel = depth_panel(depth, max_depth=max_depth)
+        caption(dpanel, [
+            "depth",
+            f"{valid.min():.2f}-{valid.max():.2f} m" if valid.size else "no valid depth",
+        ])
+        rows.append(stack_panels([rgb, dpanel], row_height))
+
+    # Rows can differ in width if the cameras have different aspect ratios.
+    width = max(r.shape[1] for r in rows)
+    padded = [
+        r if r.shape[1] == width
+        else np.pad(r, ((0, 0), (0, width - r.shape[1]), (0, 0)))
+        for r in rows
+    ]
+    left = np.vstack(padded)
+
+    if bev is None:
+        return left
+
+    span_z = bounds_max[2] - bounds_min[2]
+    bpanel = bev_panel(
+        bev, voxel_size, (bounds_min[0], bounds_min[2]),
+        size=(left.shape[0], left.shape[0]),
+        rings_m=tuple(round(span_z * f, 1) for f in (0.25, 0.5, 0.75)),
+    )
+    if bev_note:
+        caption(bpanel, [bev_note], origin=(10, bpanel.shape[0] - 34),
+                colour=(120, 220, 255))
+    return np.hstack([left, bpanel])
+
+
 def stack_panels(panels: list[np.ndarray], height: int) -> np.ndarray:
     """Scale panels to a common height and lay them out left to right."""
     out = []
