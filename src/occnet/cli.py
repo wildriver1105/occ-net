@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
 
@@ -496,6 +498,183 @@ def live(
         out_grid = Path("out/grid.npz")
         grid.save(out_grid)
         console.print(f"[green]saved occupancy grid -> {out_grid}[/green] ({grid.stats()['occupied']:.0f} occupied voxels)")
+
+
+@app.command()
+def play(
+    video: Optional[Path] = typer.Argument(None, help="Video file; omitted renders a synthetic test clip"),
+    config: Optional[Path] = _CONFIG_OPT,
+    out: Optional[Path] = typer.Option(None, "--out", "-o", help="Write the annotated result to an mp4"),
+    window: bool = typer.Option(True, "--window/--no-window", help="Show a live window"),
+    max_frames: Optional[int] = typer.Option(None, "--max-frames", "-n"),
+    width: int = typer.Option(960, "--width", help="Resize input to this width"),
+    alert_m: Optional[float] = typer.Option(None, "--alert", help="Tint anything closer than this, in metres"),
+    hfov: float = typer.Option(70.0, "--hfov", help="Horizontal FOV assumed for the clip, in degrees"),
+    stride: int = typer.Option(3, "--stride", help="Pixel stride when lifting depth"),
+    carve_stride: int = typer.Option(4, "--carve-stride", help="Carve free space with every Nth ray"),
+    auto_range: bool = typer.Option(True, "--auto-range/--fixed-range",
+                                    help="Size the grid from the clip's own depth range"),
+    loop: bool = typer.Option(False, "--loop"),
+) -> None:
+    """Run depth + occupancy inference over a video and show the result.
+
+    This is the offline counterpart to `occnet live`: it needs no cameras and no
+    camera permission, so it is the fastest way to see what the model actually
+    produces.
+    """
+    import cv2
+    import numpy as np
+
+    from .depth.mono import MonoDepth
+    from .fusion.grid import GridConfig, OccupancyGrid, fit_bounds
+    from .fusion.lift import lift_depth
+    from .geometry import CameraModel
+    from .overlay import bev_panel, caption, depth_panel, near_field_mask, stack_panels
+    from .video import VideoSource, make_test_video
+
+    cfg = _load_config(config)
+
+    if video is None:
+        video = Path("out/testclip.mp4")
+        console.print(f"no video given — rendering a synthetic corridor to {video}")
+        make_test_video(video)
+
+    src = VideoSource(video, loop=loop, resize_width=width)
+    console.print(f"input : {src.info}")
+
+    w, h = src.output_size
+    # A video carries no calibration, so we assume a plain pinhole at the given
+    # FOV. Depth is therefore only as metric as that assumption.
+    cam = CameraModel.guess("video", w, h, hfov_deg=hfov)
+    console.print(f"camera: assumed pinhole, hfov {hfov:.0f} deg -> fx {cam.fx:.1f}")
+
+    depth_model = MonoDepth(cfg.mono)
+    console.print(f"model : {depth_model.repo}")
+    depth_model.load()
+
+    grid_cfg = GridConfig(**{**asdict(cfg.grid), "carve_stride": carve_stride})
+    if auto_range:
+        # Probe one frame so the volume matches the scene. A grid that does not
+        # cover the observed depths drops every point and looks like a bug.
+        probe = VideoSource(video, resize_width=width)
+        first = next(probe.frames(max_frames=1), None)
+        probe.release()
+        if first is None:
+            console.print("[red]video has no frames[/red]")
+            raise typer.Exit(1)
+        try:
+            lo, hi, voxel = fit_bounds(depth_model(first.image), cam.hfov_deg, cam.vfov_deg)
+            grid_cfg = GridConfig(**{
+                **asdict(grid_cfg),
+                "bounds_min": lo, "bounds_max": hi, "voxel_size": voxel,
+                "max_ray_m": float(np.linalg.norm(np.array(hi) - np.array(lo))),
+            })
+            console.print(
+                f"range : auto-fitted to {lo[2]:.1f}-{hi[2]:.1f} m depth, voxel {voxel * 100:.1f} cm"
+            )
+        except ValueError as exc:
+            console.print(f"[yellow]auto-range failed ({exc}); using the config's grid[/yellow]")
+
+    if alert_m is None:
+        # Default the alert to the near quarter of the volume rather than a
+        # fixed metre value that may be outside the scene entirely.
+        alert_m = grid_cfg.bounds_min[2] + 0.25 * (grid_cfg.bounds_max[2] - grid_cfg.bounds_min[2])
+        console.print(f"alert : auto-set to {alert_m:.2f} m")
+
+    grid = OccupancyGrid(grid_cfg)
+    console.print(
+        f"grid  : {grid.shape} @ {grid_cfg.voxel_size * 100:.1f} cm "
+        f"({grid.n_voxels / 1e6:.2f} M voxels) on {grid.device}"
+    )
+
+    writer = None
+    if window:
+        cv2.namedWindow("occnet — inference", cv2.WINDOW_NORMAL)
+
+    max_depth = float(grid_cfg.bounds_max[2])
+    panel_h = 420
+    n = 0
+    ms_ema = 0.0
+    try:
+        for frame in src.frames(max_frames=max_frames):
+            t0 = time.perf_counter()
+            depth = depth_model(frame.image)
+            pts, _ = lift_depth(
+                depth, cam, None, stride=stride,
+                max_depth_m=cfg.mono.max_depth_m, min_depth_m=cfg.mono.min_depth_m,
+            )
+            # Each video frame is treated as a fresh observation from the origin.
+            # There is no ego-motion estimate here, so evidence is decayed rather
+            # than accumulated — otherwise a moving camera smears the grid.
+            grid.decay(0.90)
+            if len(pts):
+                grid.integrate(pts, np.zeros(3))
+            elapsed = (time.perf_counter() - t0) * 1000
+            ms_ema = elapsed if not ms_ema else 0.9 * ms_ema + 0.1 * elapsed
+
+            rgb = near_field_mask(frame.image, depth, alert_m)
+            valid = depth[depth > 0]
+            caption(rgb, [
+                f"frame {frame.index}",
+                f"near-field alert < {alert_m:.1f} m",
+            ])
+            dpanel = depth_panel(depth, max_depth=max_depth)
+            caption(dpanel, [
+                "metric depth",
+                f"{valid.min():.2f}-{valid.max():.2f} m" if valid.size else "no valid depth",
+                f"model {depth_model.last_ms:.0f} ms",
+            ])
+            span = grid_cfg.bounds_max[2] - grid_cfg.bounds_min[2]
+            bpanel = bev_panel(
+                grid.bev(), grid_cfg.voxel_size,
+                (grid_cfg.bounds_min[0], grid_cfg.bounds_min[2]),
+                size=(panel_h, panel_h),
+                rings_m=tuple(round(span * f, 1) for f in (0.25, 0.5, 0.75)),
+            )
+
+            canvas = stack_panels([rgb, dpanel, bpanel], panel_h)
+            stats = grid.stats()
+            caption(canvas, [
+                f"{1000 / ms_ema:5.1f} fps   step {ms_ema:5.1f} ms   pts {len(pts):6d}",
+                f"occupied {int(stats['occupied']):6d} voxels   explored {stats['explored_pct']:.1f}%",
+            ], origin=(10, canvas.shape[0] - 60))
+
+            if out is not None:
+                if writer is None:
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    writer = cv2.VideoWriter(
+                        str(out), cv2.VideoWriter_fourcc(*"mp4v"),
+                        min(src.info.fps, 30.0), (canvas.shape[1], canvas.shape[0]),
+                    )
+                    if not writer.isOpened():
+                        raise RuntimeError(f"could not open video writer for {out}")
+                writer.write(canvas)
+
+            if window:
+                cv2.imshow("occnet — inference", canvas)
+                if (cv2.waitKey(1) & 0xFF) in (ord("q"), 27):
+                    break
+
+            if n % 20 == 0:
+                console.print(
+                    f"  frame {frame.index:5d} · {elapsed:6.1f} ms · "
+                    f"depth {depth_model.last_ms:5.1f} ms · occupied {int(stats['occupied']):6d}"
+                )
+            n += 1
+    except KeyboardInterrupt:
+        console.print("\nstopping…")
+    finally:
+        src.release()
+        if writer is not None:
+            writer.release()
+        if window:
+            cv2.destroyAllWindows()
+            for _ in range(5):
+                cv2.waitKey(1)
+
+    console.print(f"[green]{n} frames at {1000 / ms_ema:.1f} fps average[/green]" if ms_ema else "no frames")
+    if out is not None:
+        console.print(f"[green]wrote {out}[/green]")
 
 
 @app.command()

@@ -67,6 +67,39 @@ class GridConfig:
         return _logit(self.prob_miss)
 
 
+def fit_bounds(
+    depth: np.ndarray,
+    hfov_deg: float,
+    vfov_deg: float,
+    voxel_budget: int = 3_000_000,
+    percentile: float = 98.0,
+    margin: float = 1.1,
+) -> tuple[tuple[float, float, float], tuple[float, float, float], float]:
+    """Size a grid to whatever a depth map actually contains.
+
+    An occupancy volume that does not match the scene is the most common reason
+    a reconstruction looks empty: the points land outside the bounds and are
+    silently dropped. This picks bounds from the observed depth distribution and
+    then chooses the finest voxel size that stays within ``voxel_budget``.
+
+    Returns ``(bounds_min, bounds_max, voxel_size)`` in the camera frame.
+    """
+    valid = depth[depth > 0]
+    if valid.size == 0:
+        raise ValueError("depth map has no valid pixels to fit bounds to")
+    z_max = float(np.percentile(valid, percentile)) * margin
+    x_half = z_max * np.tan(np.radians(hfov_deg) / 2)
+    y_half = z_max * np.tan(np.radians(vfov_deg) / 2)
+
+    extent = np.array([2 * x_half, 2 * y_half, z_max], dtype=np.float64)
+    voxel = float(np.cbrt(extent.prod() / voxel_budget))
+    # Snap to a readable size so logs and configs stay tidy.
+    voxel = float(min(s for s in (0.02, 0.025, 0.03, 0.04, 0.05, 0.075, 0.1, 0.15, 0.2)
+                      if s >= voxel * 0.999) if voxel <= 0.2 else round(voxel, 2))
+
+    return (-x_half, -y_half, 0.0), (x_half, y_half, z_max), voxel
+
+
 def _pick_device(preferred: str) -> torch.device:
     if preferred != "auto":
         return torch.device(preferred)
@@ -231,6 +264,25 @@ class OccupancyGrid:
         if flat.numel() == 0:
             return np.zeros((0, 3), np.float32)
         return self.voxel_centers(flat).detach().cpu().numpy().astype(np.float32)
+
+    def bev(self, height_range: tuple[float, float] | None = None) -> np.ndarray:
+        """Top-down occupancy map, as a (depth, width) float32 array.
+
+        Collapses the vertical axis by taking the maximum occupancy probability
+        in each column, which is the reading that matters for "can I drive/sail
+        through this column of space".
+
+        ``height_range`` restricts the collapse to a slice of the vertical (y)
+        axis in world metres — use it to ignore the floor or the ceiling.
+        """
+        vol = self.probability_volume()  # (nx, ny, nz)
+        if height_range is not None:
+            lo, hi = height_range
+            y0 = int(np.clip((lo - self.origin[1]) / self.cfg.voxel_size, 0, self.dims[1] - 1))
+            y1 = int(np.clip((hi - self.origin[1]) / self.cfg.voxel_size, y0 + 1, self.dims[1]))
+            vol = vol[:, y0:y1, :]
+        # (nx, nz) -> transpose so depth runs down the image and x across it.
+        return vol.max(axis=1).T.astype(np.float32)
 
     def stats(self) -> dict[str, float]:
         lo = self.log_odds.cpu() if self.log_odds.device.type == "mps" else self.log_odds

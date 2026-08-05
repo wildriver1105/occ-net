@@ -74,6 +74,31 @@ uv run occnet preview
 `preview` opens both cameras side by side with live FPS and inter-camera skew.
 `q` quits, `s` saves a snapshot pair.
 
+### Seeing inference without a camera
+
+`occnet play` runs the same depth and occupancy stack over a video file, so it
+needs no cameras and no camera permission. It is the fastest way to see what the
+model actually produces.
+
+```bash
+uv run occnet play myclip.mp4
+uv run occnet play                                   # renders a synthetic test clip
+uv run occnet play myclip.mp4 --out out/annotated.mp4 --no-window
+```
+
+Three panels: the frame with a near-field alert overlay, the metric depth map,
+and a top-down BEV occupancy map with range rings.
+
+A video carries no calibration, so `play` assumes a plain pinhole camera at
+`--hfov` degrees — depth is only as metric as that assumption. By default
+`--auto-range` sizes the occupancy volume from the clip's own depth
+distribution; a grid that does not cover the observed depths silently drops
+every point and looks like an empty reconstruction.
+
+Measured at 960px wide on Apple silicon: ~13 fps, of which ~25 ms is the depth
+model and most of the rest is free-space carving (lower it with
+`--carve-stride`).
+
 ## The pipeline
 
 ```
@@ -191,6 +216,8 @@ src/occnet/
   devices.py      AVFoundation enumeration (ffmpeg-backed), role matching
   capture.py      Threaded multi-camera capture, OpenCV + ffmpeg backends
   viewer.py       Live side-by-side window, reused by the calibration flows
+  video.py        Video-file input and the synthetic test clip
+  overlay.py      Inference panels: depth colormap, near-field alert, BEV
   geometry.py     CameraModel, RigCalibration, transform helpers
   config.py       rig.yaml schema
   pipeline.py     Reconstructor — frames in, occupancy evidence out
