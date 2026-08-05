@@ -93,13 +93,19 @@ class Reconstructor:
         if mode in ("stereo", "both"):
             names = list(rig.cameras)
             if len(names) < 2:
-                raise ValueError("stereo mode needs two calibrated cameras")
-            left = rig.reference
-            right = next(n for n in names if n != left)
-            if not np.any(rig.T_rig_cam(right)[:3, 3]):
                 raise ValueError(
-                    "stereo mode needs rig extrinsics; run `occnet calib stereo` first"
+                    f"'{mode}' mode needs two calibrated cameras, have {names}"
                 )
+            first = rig.reference if rig.reference in names else names[0]
+            second = next(n for n in names if n != first)
+            if not np.any(rig.T_rig_cam(second)[:3, 3]):
+                raise ValueError(
+                    f"'{mode}' mode needs rig extrinsics — the cameras are both at the "
+                    "origin, so there is no baseline to triangulate against. "
+                    "Run `occnet calib intrinsics` for each camera, then `occnet calib stereo`."
+                )
+            # Physical left/right, not config order: the matcher assumes one.
+            left, right = order_stereo_pair(rig, first, second)
             self.stereo = StereoDepth(rig, left, right, cfg.stereo)
             self.stereo_pair = (left, right)
 

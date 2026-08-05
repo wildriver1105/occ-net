@@ -140,15 +140,31 @@ Metric 3D needs real intrinsics. Print the target, then solve each camera:
 
 ```bash
 uv run occnet board                 # writes out/charuco.png
+uv run occnet board --show          # no printer: display it on a monitor instead
 ```
 
 Print it at **100% scale** (no "fit to page"), then **measure one square with a
 ruler** and put the measured value in `board.square_m` in your config. Every
 metric distance downstream is scaled by that number.
 
+`--show` puts the board on screen instead. A monitor is perfectly flat and
+rigid, which is better than paper taped to a wall — but it cannot be tilted, so
+you move the *camera* around the screen rather than the board around the camera.
+Measure a square on the glass with a ruler, and do not resize the window
+afterwards.
+
+Calibration writes one file per named camera, so it needs explicit names rather
+than `--all`. `configs/rig-pair.yaml` pins the two roles the scanner reports:
+
 ```bash
-uv run occnet calib intrinsics --camera insta360
-uv run occnet calib intrinsics --camera iphone
+uv run occnet calib intrinsics --camera builtin -c configs/rig-pair.yaml
+uv run occnet calib intrinsics --camera iphone  -c configs/rig-pair.yaml
+```
+
+`--all` also works, picking the named camera out of a live scan:
+
+```bash
+uv run occnet calib intrinsics --camera iphone --all
 ```
 
 Hold the board so it reaches **all four corners** of the frame, and tilt it
@@ -165,8 +181,13 @@ fisheye optics.
 Then solve where the cameras sit relative to each other:
 
 ```bash
-uv run occnet calib stereo
+uv run occnet calib stereo -c configs/rig-pair.yaml
 ```
+
+Which camera is "left" is decided from the solved extrinsics, not from config
+order — the block matcher assumes the second camera sits to the right of the
+first, and feeding it the wrong way round yields negative disparity everywhere,
+so the depth map comes back empty rather than wrong.
 
 Mount both cameras rigidly first, and **do not move them relative to each other
 afterwards** — the extrinsics go stale silently, and depth quietly becomes

@@ -18,6 +18,7 @@ from occnet.calib.board import BoardSpec, make_board
 from occnet.calib.extrinsics import PairView, calibrate_rig
 from occnet.calib.intrinsics import CalibrationSet, calibrate_intrinsics, detect_board
 from occnet.config import RigConfig
+from occnet.depth.stereo import StereoDepthConfig
 from occnet.fusion.grid import GridConfig, OccupancyGrid
 from occnet.fusion.lift import lift_depth
 from occnet.geometry import PINHOLE, CameraModel, invert, rt_to_matrix, transform_points
@@ -283,8 +284,47 @@ def test_overlay() -> None:
     check("inference view is not blank", int(canvas.max()) > 0 and float(canvas.std()) > 5)
 
 
+def test_stereo_setup() -> None:
+    print("\n[5] stereo pair ordering and guardrails")
+    from occnet.depth.stereo import StereoDepth, order_stereo_pair
+    from occnet.geometry import RigCalibration
+    from occnet.pipeline import Reconstructor
+
+    cams = {
+        "a": CameraModel.guess("a", 640, 360, 68.0),
+        "b": CameraModel.guess("b", 640, 360, 68.0),
+    }
+
+    def rig_with(dx: float) -> RigCalibration:
+        return RigCalibration(
+            reference="a", cameras=cams,
+            poses={"a": np.eye(4), "b": rt_to_matrix(np.zeros(3), np.array([dx, 0.0, 0.0]))},
+        )
+
+    # SGBM needs the physically-left camera first, whichever way they are named.
+    check("orders a left-of-b correctly", order_stereo_pair(rig_with(0.15), "a", "b") == ("a", "b"))
+    check("orders b left-of-a correctly", order_stereo_pair(rig_with(-0.15), "a", "b") == ("b", "a"))
+
+    rig = rig_with(0.12)
+    stereo = StereoDepth(rig, "a", "b", StereoDepthConfig(wls_filter=False))
+    err_mm = abs(stereo.baseline_m - 0.12) * 1000
+    check("rectified baseline matches the extrinsics", err_mm < 0.5, f"{err_mm:.3f} mm error")
+
+    # Uncalibrated rigs must refuse rather than silently produce zero disparity.
+    flat = RigCalibration(reference="a", cameras=cams, poses={"a": np.eye(4), "b": np.eye(4)})
+    cfg = RigConfig.load("configs/rig-pair.yaml")
+    raised = ""
+    try:
+        Reconstructor(cfg, flat, mode="both")
+    except ValueError as exc:
+        raised = str(exc)
+    check("refuses stereo without extrinsics", "extrinsics" in raised,
+          raised.split("—")[0].strip() or "no error raised")
+    check("says how to fix it", "calib stereo" in raised)
+
+
 def test_config() -> None:
-    print("\n[5] configuration round-trip")
+    print("\n[6] configuration round-trip")
     import tempfile
 
     for name in ("configs/rig.yaml", "configs/rig-builtin.yaml"):
@@ -310,6 +350,7 @@ def main() -> int:
         test_extrinsics(spec, truth)
     test_fusion()
     test_overlay()
+    test_stereo_setup()
     test_config()
 
     print(f"\n{len(PASSES)} passed, {len(FAILS)} failed")

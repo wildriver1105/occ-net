@@ -19,6 +19,20 @@ import numpy as np
 from ..geometry import CameraModel, RigCalibration, invert
 
 
+def order_stereo_pair(rig: RigCalibration, a: str, b: str) -> tuple[str, str]:
+    """Return the pair as ``(left, right)`` in the order SGBM expects.
+
+    ``stereoRectify`` and the block matcher assume the second camera sits to the
+    right of the first, which shows up as a negative x translation going from
+    the first camera's frame to the second. Feed them in the wrong order and
+    every disparity comes out negative, so the depth map is silently empty
+    rather than wrong — a failure that is easy to misread as "stereo doesn't
+    work here".
+    """
+    T_b_a = invert(rig.T_rig_cam(b)) @ rig.T_rig_cam(a)
+    return (a, b) if float(T_b_a[0, 3]) <= 0 else (b, a)
+
+
 @dataclass
 class StereoDepthConfig:
     min_disparity: int = 0

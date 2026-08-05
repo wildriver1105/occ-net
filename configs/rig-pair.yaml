@@ -1,0 +1,69 @@
+# Calibration rig — MacBook built-in + iPhone, named to match `occnet devices`.
+#
+# Calibration has to name its cameras (each solve is written to
+# data/calib-pair/<name>.json), so this config pins the two roles that the
+# scanner currently reports. Everything else can keep using `--all`.
+#
+#   occnet calib intrinsics --camera builtin -c configs/rig-pair.yaml
+#   occnet calib intrinsics --camera iphone  -c configs/rig-pair.yaml
+#   occnet calib stereo                      -c configs/rig-pair.yaml
+#   occnet live --mode both                  -c configs/rig-pair.yaml
+cameras:
+  builtin: builtin
+  iphone: iphone
+
+# The built-in camera is bolted into the lid, so it is the more stable choice
+# for the rig frame; the iPhone is the one that gets bumped.
+reference: builtin
+
+capture:
+  width: 1280
+  height: 720
+  fps: 30.0
+  backend: auto
+  startup_timeout: 12.0
+
+# MEASURE the printed (or on-screen) square with a ruler and put the real value
+# in square_m before calibrating. Every metric distance downstream scales with
+# it — a 10% error here is a 10% error in every depth you ever read.
+board:
+  squares_x: 8
+  squares_y: 11
+  square_m: 0.030
+  marker_m: 0.022
+  dictionary: 5x5_250
+
+mono:
+  model: small
+  device: auto
+  input_height: 392
+  fp16: true
+  min_depth_m: 0.15
+  max_depth_m: 12.0
+
+# num_disparities caps how close a surface can be before it falls out of the
+# search range. Raise it (in steps of 16) if near objects come back empty.
+stereo:
+  num_disparities: 128
+  block_size: 5
+  uniqueness_ratio: 10
+  wls_filter: true
+  min_depth_m: 0.15
+  max_depth_m: 12.0
+
+grid:
+  voxel_size: 0.04
+  bounds_min: [-1.5, -1.2, 0.0]
+  bounds_max: [1.5, 1.2, 3.0]
+  prob_hit: 0.85
+  prob_miss: 0.35
+  clamp_min: -2.5
+  clamp_max: 3.5
+  occupied_threshold: 0.65
+  surface_margin_m: 0.05
+  ray_step_ratio: 0.5
+  carve_stride: 4
+  max_ray_m: 6.0
+  device: auto
+
+calib_dir: data/calib-pair

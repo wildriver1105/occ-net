@@ -283,11 +283,44 @@ def board(
     config: Optional[Path] = _CONFIG_OPT,
     out: Path = typer.Option(Path("out/charuco.png"), "--out", "-o"),
     dpi: int = typer.Option(300, "--dpi"),
+    show: bool = typer.Option(False, "--show", help="Display the board on screen instead of printing"),
 ) -> None:
-    """Render the ChArUco calibration target for printing."""
-    from .calib.board import render_board
+    """Render the ChArUco calibration target, for printing or on-screen display."""
+    import cv2
+
+    from .calib.board import make_board, render_board
 
     cfg = _load_config(config)
+
+    if show:
+        # A monitor is a perfectly flat, rigid target — better than paper taped
+        # to a wall, and it needs no printer. The trade-off is that the board
+        # cannot be tilted, so you move the *camera* around it instead.
+        board_obj, _ = make_board(cfg.board)
+        px_per_square = 110
+        size = (cfg.board.squares_x * px_per_square, cfg.board.squares_y * px_per_square)
+        img = board_obj.generateImage(size, marginSize=0, borderBits=1)
+        window = "occnet board — measure one square, then press q"
+        cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(window, *size)
+        console.print(
+            f"Displaying a {cfg.board.squares_x}x{cfg.board.squares_y} board at "
+            f"{px_per_square} px per square.\n"
+            "[bold]Measure one square on the screen with a ruler[/bold] and put that value "
+            "(in metres) into [bold]board.square_m[/bold] in your config.\n"
+            "[yellow]Do not resize the window afterwards — that changes the physical "
+            "square size and silently rescales every distance you measure later.[/yellow]\n"
+            "[dim]q to close[/dim]"
+        )
+        while True:
+            cv2.imshow(window, img)
+            if (cv2.waitKey(50) & 0xFF) in (ord("q"), 27):
+                break
+        cv2.destroyAllWindows()
+        for _ in range(5):
+            cv2.waitKey(1)
+        return
+
     path = render_board(cfg.board, out, dpi=dpi)
     w_m, h_m = cfg.board.size_m
     console.print(f"[green]wrote {path}[/green]")
@@ -296,14 +329,16 @@ def board(
         f"Expected board size: {w_m * 100:.1f} x {h_m * 100:.1f} cm, "
         f"square {cfg.board.square_m * 1000:.1f} mm.\n"
         f"[yellow]If the printed square differs, update board.square_m in your config — "
-        f"every metric distance downstream is scaled by it.[/yellow]"
+        f"every metric distance downstream is scaled by it.[/yellow]\n"
+        f"[dim]No printer? `occnet board --show` displays it on a monitor instead.[/dim]"
     )
 
 
 @calib_app.command("intrinsics")
 def calib_intrinsics(
-    camera: str = typer.Option(..., "--camera", help="Camera name from the config"),
+    camera: str = typer.Option(..., "--camera", help="Camera name (from the config, or a scanned role)"),
     config: Optional[Path] = _CONFIG_OPT,
+    all_cameras: bool = _ALL_OPT,
     model: str = typer.Option("rational", "--model", help="pinhole | rational | fisheye"),
     target_views: int = typer.Option(20, "--views", help="Views to collect before solving"),
     auto: bool = typer.Option(True, "--auto/--manual", help="Auto-capture novel board views"),
@@ -319,11 +354,18 @@ def calib_intrinsics(
     from .viewer import run_viewer
 
     cfg = _load_config(config)
-    if camera not in cfg.cameras:
-        console.print(f"[red]{camera!r} is not in the config; have {list(cfg.cameras)}[/red]")
+    use_discovery = all_cameras or getattr(cfg, "discover", False)
+    if not use_discovery and camera not in cfg.cameras:
+        console.print(
+            f"[red]{camera!r} is not in the config; have {list(cfg.cameras)}[/red]\n"
+            "[yellow]Pass --all to pick from the cameras actually plugged in.[/yellow]"
+        )
         raise typer.Exit(1)
 
-    res = _resolve_rig(cfg, only={camera: cfg.cameras[camera]})
+    if use_discovery:
+        res = _resolve_rig(cfg, discover=True, only_names=camera)
+    else:
+        res = _resolve_rig(cfg, only={camera: cfg.cameras[camera]})
     device = res.resolved[camera]
     console.print(f"calibrating [bold]{camera}[/bold] -> {device}")
 
@@ -398,6 +440,8 @@ def calib_intrinsics(
 @calib_app.command("stereo")
 def calib_stereo(
     config: Optional[Path] = _CONFIG_OPT,
+    all_cameras: bool = _ALL_OPT,
+    only: Optional[str] = _ONLY_OPT,
     method: str = typer.Option("stereo", "--method", help="stereo | pnp"),
     target_views: int = typer.Option(15, "--views"),
 ) -> None:
@@ -414,23 +458,33 @@ def calib_stereo(
     from .viewer import run_viewer
 
     cfg = _load_config(config)
-    names = list(cfg.cameras)
+    res = _resolve_rig(cfg, discover=all_cameras, only_names=only)
+    names = list(res.resolved)
     if len(names) < 2:
-        console.print("[red]Need two cameras in the config.[/red]")
+        console.print(f"[red]Need two cameras; resolved {names}.[/red]")
         raise typer.Exit(1)
+    if len(names) > 2:
+        console.print(
+            f"[yellow]{len(names)} cameras resolved; extrinsics are solved pairwise. "
+            f"Using {names[:2]} — use --only to choose a different pair.[/yellow]"
+        )
+        names = names[:2]
+        res.resolved = {n: res.resolved[n] for n in names}
 
     cameras: dict[str, CameraModel] = {}
     for name in names:
         path = cfg.intrinsics_path(name)
         if not path.exists():
-            console.print(f"[red]Missing intrinsics for {name}: run `occnet calib intrinsics --camera {name}`[/red]")
+            console.print(
+                f"[red]Missing intrinsics for {name}[/red]: run "
+                f"`occnet calib intrinsics --camera {name}`"
+                + (" --all" if all_cameras or getattr(cfg, "discover", False) else "")
+            )
             raise typer.Exit(1)
         cameras[name] = CameraModel.load(path)
 
-    ref = cfg.reference
+    ref = _effective_reference(cfg, names)
     other = next(n for n in names if n != ref)
-
-    res = _resolve_rig(cfg)
     board_obj, detector = make_board(cfg.board)
     views: list[PairView] = []
     state = {"last": 0.0}
