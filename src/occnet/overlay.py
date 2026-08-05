@@ -11,6 +11,17 @@ import numpy as np
 
 _FONT = cv2.FONT_HERSHEY_SIMPLEX
 
+# Turbo runs dark purple -> blue -> green -> orange -> dark maroon, so both ends
+# lose luminance. Clipping to this window keeps "near" a vivid red instead of a
+# muddy brown and "far" a clear blue instead of near-black.
+_TURBO_FAR, _TURBO_NEAR = 24, 240
+
+
+def _turbo(norm: np.ndarray) -> np.ndarray:
+    """Map normalised distance in [0,1] (0 = nearest) to BGR via clipped turbo."""
+    idx = _TURBO_NEAR - np.clip(norm, 0, 1) * (_TURBO_NEAR - _TURBO_FAR)
+    return cv2.applyColorMap(idx.astype(np.uint8), cv2.COLORMAP_TURBO)
+
 
 def caption(img: np.ndarray, lines: list[str], origin: tuple[int, int] = (10, 10),
             colour: tuple[int, int, int] = (255, 255, 255)) -> None:
@@ -26,16 +37,58 @@ def caption(img: np.ndarray, lines: list[str], origin: tuple[int, int] = (10, 10
         cv2.putText(img, text, (x + pad, y + pad + lh * i + 11), _FONT, 0.48, colour, 1, cv2.LINE_AA)
 
 
-def depth_panel(depth: np.ndarray, max_depth: float = 8.0) -> np.ndarray:
-    """Colour-map a metric depth map; invalid pixels stay black."""
+def depth_panel(
+    depth: np.ndarray,
+    max_depth: float = 8.0,
+    auto_scale: bool = True,
+    percentiles: tuple[float, float] = (2.0, 98.0),
+    legend: bool = True,
+) -> np.ndarray:
+    """Colour-map a metric depth map: near is red, far is blue, invalid is black.
+
+    By default the colour scale spans what the frame actually contains rather
+    than the full ``0..max_depth`` range. Fixing the scale to the grid's depth
+    wastes most of the palette — a desk scene at 1-2 m inside an 8 m volume
+    lands entirely in the orange band and reads as flat, even though the
+    mapping is technically correct. Percentile endpoints also stop a handful of
+    stray far pixels from compressing everything else.
+
+    Pass ``auto_scale=False`` to compare frames on one absolute scale.
+    """
     valid = depth > 0
-    norm = np.zeros_like(depth, np.float32)
+    if auto_scale and valid.any():
+        near, far = (float(v) for v in np.percentile(depth[valid], percentiles))
+        if far - near < 1e-3:
+            near, far = near, near + 1e-3
+    else:
+        near, far = 0.0, float(max_depth)
+
+    norm = np.ones_like(depth, np.float32)
     if valid.any():
-        norm[valid] = np.clip(depth[valid] / max_depth, 0, 1)
-    # Invert so near = warm, far = cool, which reads more naturally as distance.
-    img = cv2.applyColorMap(((1.0 - norm) * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
+        norm[valid] = np.clip((depth[valid] - near) / (far - near), 0, 1)
+    img = _turbo(norm)
     img[~valid] = 0
+
+    if legend:
+        _draw_depth_legend(img, near, far)
     return img
+
+
+def _draw_depth_legend(img: np.ndarray, near: float, far: float) -> None:
+    """Draw the colour ramp and its endpoints, so the mapping is never guessed."""
+    h, w = img.shape[:2]
+    bar_w, bar_h = min(220, w // 3), 12
+    x0, y0 = w - bar_w - 14, h - bar_h - 24
+
+    ramp = _turbo(np.linspace(0.0, 1.0, bar_w, dtype=np.float32)[None, :]).repeat(bar_h, axis=0)
+    img[y0:y0 + bar_h, x0:x0 + bar_w] = ramp
+    cv2.rectangle(img, (x0, y0), (x0 + bar_w, y0 + bar_h), (255, 255, 255), 1)
+
+    for text, tx, align_right in ((f"{near:.2f}m", x0, False), (f"{far:.2f}m", x0 + bar_w, True)):
+        (tw, _), _ = cv2.getTextSize(text, _FONT, 0.42, 1)
+        pos = (tx - tw if align_right else tx, y0 + bar_h + 13)
+        cv2.putText(img, text, pos, _FONT, 0.42, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(img, text, pos, _FONT, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
 
 
 def near_field_mask(
@@ -123,6 +176,7 @@ def render_inference_view(
     alert_m: float,
     row_height: int = 300,
     bev_note: str = "",
+    auto_scale_depth: bool = True,
 ) -> np.ndarray:
     """Lay out a multi-camera inference view.
 
@@ -139,10 +193,10 @@ def render_inference_view(
         rgb = near_field_mask(image, depth, alert_m)
         valid = depth[depth > 0]
         caption(rgb, [name, f"alert < {alert_m:.2f} m"])
-        dpanel = depth_panel(depth, max_depth=max_depth)
+        dpanel = depth_panel(depth, max_depth=max_depth, auto_scale=auto_scale_depth)
         caption(dpanel, [
-            "depth",
-            f"{valid.min():.2f}-{valid.max():.2f} m" if valid.size else "no valid depth",
+            "depth  red=near  blue=far",
+            f"range {valid.min():.2f}-{valid.max():.2f} m" if valid.size else "no valid depth",
         ])
         rows.append(stack_panels([rgb, dpanel], row_height))
 

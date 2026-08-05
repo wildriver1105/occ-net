@@ -596,6 +596,9 @@ def watch(
     row_height: int = typer.Option(300, "--row-height"),
     decay: float = typer.Option(0.92, "--decay", help="Per-frame evidence decay; 1.0 accumulates forever"),
     auto_range: bool = typer.Option(True, "--auto-range/--fixed-range"),
+    absolute_depth_colors: bool = typer.Option(
+        False, "--absolute-colors",
+        help="Colour depth on a fixed 0..volume scale instead of per-frame contrast"),
     out: Optional[Path] = typer.Option(None, "--out", "-o", help="Also record the view to an mp4"),
     window: bool = typer.Option(True, "--window/--no-window"),
 ) -> None:
@@ -716,6 +719,7 @@ def watch(
                     panels, grid.bev(), grid_cfg.voxel_size,
                     grid_cfg.bounds_min, grid_cfg.bounds_max,
                     alert_m=alert_m, row_height=row_height, bev_note=bev_note,
+                    auto_scale_depth=not absolute_depth_colors,
                 )
                 stats = grid.stats()
                 caption(canvas, [
@@ -889,8 +893,8 @@ def play(
             ])
             dpanel = depth_panel(depth, max_depth=max_depth)
             caption(dpanel, [
-                "metric depth",
-                f"{valid.min():.2f}-{valid.max():.2f} m" if valid.size else "no valid depth",
+                "depth  red=near  blue=far",
+                f"range {valid.min():.2f}-{valid.max():.2f} m" if valid.size else "no valid depth",
                 f"model {depth_model.last_ms:.0f} ms",
             ])
             span = grid_cfg.bounds_max[2] - grid_cfg.bounds_min[2]

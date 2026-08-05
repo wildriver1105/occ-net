@@ -110,6 +110,12 @@ uv run occnet play myclip.mp4 --out out/annotated.mp4 --no-window
 Three panels: the frame with a near-field alert overlay, the metric depth map,
 and a top-down BEV occupancy map with range rings.
 
+Depth colours run **red = near, blue = far**, and the scale spans what the frame
+actually contains rather than the full volume — a desk scene at 1–2 m inside an
+8 m grid would otherwise land entirely in the orange band and read as flat. The
+colour bar in the corner always states the two endpoints in metres. Pass
+`--absolute-colors` to compare frames on one fixed scale instead.
+
 A video carries no calibration, so `play` assumes a plain pinhole camera at
 `--hfov` degrees — depth is only as metric as that assumption. By default
 `--auto-range` sizes the occupancy volume from the clip's own depth
