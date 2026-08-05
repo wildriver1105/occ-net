@@ -169,6 +169,30 @@ class RigResolution:
         return not self.missing
 
 
+def _slug(name: str) -> str:
+    keep = [c.lower() if c.isalnum() else "_" for c in name]
+    return "".join(keep).strip("_").replace("__", "_") or "cam"
+
+
+def discover_all() -> dict[str, Device]:
+    """Every usable camera, keyed by a stable readable name.
+
+    Preferable to naming devices explicitly when you just want "whatever is
+    plugged in": AVFoundation reorders its device list at runtime, so an index
+    written into a config goes stale as soon as a Continuity Camera connects.
+    Keys are derived from the recognised role, falling back to the device name,
+    with a numeric suffix when several devices share one role.
+    """
+    out: dict[str, Device] = {}
+    counts: dict[str, int] = {}
+    for d in list_devices():
+        base = d.role if d.role != "other" else _slug(d.name)
+        n = counts.get(base, 0)
+        counts[base] = n + 1
+        out[base if n == 0 else f"{base}{n + 1}"] = d
+    return out
+
+
 def resolve_rig(wanted: dict[str, str | int]) -> RigResolution:
     """Map camera keys to concrete devices.
 

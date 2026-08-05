@@ -28,6 +28,10 @@ class RigConfig:
     cameras: dict[str, str | int] = field(
         default_factory=lambda: {"insta360": "insta360", "iphone": "iphone"}
     )
+    # ``cameras: all`` in YAML sets this, meaning "use every camera found at
+    # startup". More robust than naming devices, because AVFoundation reorders
+    # its device list at runtime.
+    discover: bool = False
     reference: str = "insta360"
     capture: CaptureConfig = field(default_factory=CaptureConfig)
     board: BoardSpec = field(default_factory=BoardSpec)
@@ -37,6 +41,8 @@ class RigConfig:
     calib_dir: str = "data/calib"
 
     def __post_init__(self) -> None:
+        if self.discover:
+            return  # cameras are only known once the rig is scanned
         if self.reference not in self.cameras:
             raise ValueError(
                 f"reference camera {self.reference!r} is not in cameras {list(self.cameras)}"
@@ -51,7 +57,7 @@ class RigConfig:
 
     def to_dict(self) -> dict:
         return {
-            "cameras": dict(self.cameras),
+            "cameras": "all" if self.discover else dict(self.cameras),
             "reference": self.reference,
             "capture": asdict(self.capture),
             "board": self.board.to_dict(),
@@ -71,8 +77,11 @@ class RigConfig:
             return klass(**{k: v for k, v in raw.items() if k in fields})
 
         board_raw = d.get("board") or {}
+        raw_cams = d.get("cameras")
+        discover = isinstance(raw_cams, str) and raw_cams.strip().lower() == "all"
         return cls(
-            cameras=d.get("cameras") or {"insta360": "insta360", "iphone": "iphone"},
+            cameras={} if discover else (raw_cams or {"insta360": "insta360", "iphone": "iphone"}),
+            discover=discover,
             reference=d.get("reference", "insta360"),
             capture=sub("capture", CaptureConfig, CaptureConfig),
             board=BoardSpec.from_dict(board_raw) if board_raw else BoardSpec(),

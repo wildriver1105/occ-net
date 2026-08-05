@@ -131,17 +131,25 @@ class OpenCVSource(CameraSource):
 
 
 class FFmpegSource(CameraSource):
-    """Reads BGR24 rawvideo from an ffmpeg avfoundation subprocess."""
+    """Reads BGR24 rawvideo from an ffmpeg avfoundation subprocess.
+
+    Addresses the device by *name* rather than index. AVFoundation reorders its
+    device list at runtime — connecting an iPhone as a Continuity Camera can
+    push the built-in camera from index 0 to index 1 — so an index captured a
+    moment ago may already point at a different camera.
+    """
 
     def __init__(self, device: Device, cfg: CaptureConfig, name: str):
         super().__init__(device, cfg, name)
         w, h = cfg.width, cfg.height
+        # avfoundation accepts "<name>:<audio>" as well as "<index>:<audio>".
+        selector = device.name if device.name else str(device.index)
         cmd = [
             ffmpeg_bin(), "-hide_banner", "-loglevel", "error",
             "-f", "avfoundation",
             "-framerate", str(cfg.fps),
             "-video_size", f"{w}x{h}",
-            "-i", f"{device.index}:none",
+            "-i", f"{selector}:none",
             "-vf", f"scale={w}:{h}",
             "-f", "rawvideo", "-pix_fmt", "bgr24",
             "-an", "-sn", "-",

@@ -32,9 +32,20 @@ def _load_config(path: Optional[Path]):
     return RigConfig.load(path)
 
 
-def _resolve_rig(cfg, require_all: bool = True, only: Optional[dict] = None):
+_ALL_OPT = typer.Option(False, "--all", "-a", help="Use every camera found, ignoring the config's list")
+
+
+def _resolve_rig(cfg, require_all: bool = True, only: Optional[dict] = None,
+                 discover: bool = False):
     """Map configured camera names to plugged-in devices, or explain what's missing."""
-    from .devices import resolve_rig
+    from .devices import RigResolution, discover_all, resolve_rig
+
+    if only is None and (discover or getattr(cfg, "discover", False)):
+        found = discover_all()
+        if not found:
+            console.print("[red]No usable cameras found.[/red]")
+            raise typer.Exit(1)
+        return RigResolution(resolved=found, available=list(found.values()))
 
     res = resolve_rig(only if only is not None else cfg.cameras)
     if res.missing and require_all:
@@ -88,7 +99,7 @@ def devices(
 
 
 @app.command()
-def doctor(config: Optional[Path] = _CONFIG_OPT) -> None:
+def doctor(config: Optional[Path] = _CONFIG_OPT, all_cameras: bool = _ALL_OPT) -> None:
     """Check that every piece of the rig actually works."""
     import shutil
 
@@ -142,6 +153,66 @@ def doctor(config: Optional[Path] = _CONFIG_OPT) -> None:
         finally:
             rig.stop()
 
+    console.rule("all configured cameras together")
+    # Opening cameras one at a time hides the failure mode where a second
+    # AVFoundation session disturbs the first, which is exactly what a
+    # multi-camera rig runs into.
+    res = _resolve_rig(cfg, require_all=False, discover=all_cameras)
+    if res.missing:
+        console.print(f"  [yellow]not resolved: {', '.join(res.missing)} — skipping[/yellow]")
+    elif len(res.resolved) < 2:
+        console.print("  [dim]only one camera configured; nothing to combine[/dim]")
+    else:
+        rig = CameraRig(res.resolved, probe_cfg)
+        try:
+            rig.start()
+            console.print(f"  opened together: {rig.sizes()}")
+            seen = {n: 0 for n in res.resolved}
+            brightness = {n: [] for n in res.resolved}
+            deadline = time.monotonic() + 3.0
+            last_idx = {n: -1 for n in res.resolved}
+            while time.monotonic() < deadline:
+                bundle = rig.read(timeout=5.0)
+                if bundle is None:
+                    break
+                for n, f in bundle.items():
+                    if f.index != last_idx[n]:
+                        last_idx[n] = f.index
+                        seen[n] += 1
+                        brightness[n].append(float(f.image.mean()))
+
+            table = Table("camera", "frames", "fps", "mean level", "verdict")
+            for n in res.resolved:
+                levels = brightness[n]
+                mean = sum(levels) / len(levels) if levels else 0.0
+                spread = (max(levels) - min(levels)) if len(levels) > 1 else 0.0
+                if seen[n] == 0:
+                    verdict, style = "NO FRAMES", "red"
+                    ok = False
+                elif mean < 4.0 and spread < 1.0:
+                    # Frames arrive but carry no signal: lens covered, privacy
+                    # shutter, or the sensor never actually started.
+                    verdict, style = "BLACK — check for a cover", "yellow"
+                elif seen[n] < 10:
+                    verdict, style = "very low rate", "yellow"
+                else:
+                    verdict, style = "ok", "green"
+                table.add_row(
+                    n, str(seen[n]), f"{seen[n] / 3.0:.1f}", f"{mean:.1f}",
+                    f"[{style}]{verdict}[/{style}]",
+                )
+            console.print(table)
+            console.print(f"  inter-camera skew: {rig.stats.skew_ms:.1f} ms")
+        except Exception as exc:  # noqa: BLE001
+            ok = False
+            console.print(f"  [red]FAIL together[/red]: {str(exc).splitlines()[0]}")
+            console.print(
+                "  [yellow]If each camera works alone but not together, force the "
+                "subprocess backend: set `capture.backend: ffmpeg` in your config.[/yellow]"
+            )
+        finally:
+            rig.stop()
+
     if not ok:
         console.print(f"\n[yellow]{CAMERA_PERMISSION_HINT}[/yellow]")
         raise typer.Exit(1)
@@ -166,6 +237,7 @@ def init(
 @app.command()
 def preview(
     config: Optional[Path] = _CONFIG_OPT,
+    all_cameras: bool = _ALL_OPT,
     height: int = typer.Option(540, "--height", help="Tile height in the window"),
 ) -> None:
     """Show every configured camera live, side by side."""
@@ -173,7 +245,7 @@ def preview(
     from .viewer import run_viewer
 
     cfg = _load_config(config)
-    res = _resolve_rig(cfg)
+    res = _resolve_rig(cfg, discover=all_cameras)
     for name, dev in res.resolved.items():
         console.print(f"  {name} -> {dev}")
 
@@ -383,10 +455,23 @@ def calib_stereo(
     console.print("[dim]Sanity-check the baseline against a tape measure before trusting depth.[/dim]")
 
 
-def _load_rig_calibration(cfg, sizes: dict[str, tuple[int, int]]):
+def _effective_reference(cfg, names) -> str:
+    """The configured reference if it was actually found, else the first camera."""
+    names = list(names)
+    if cfg.reference in names:
+        return cfg.reference
+    console.print(
+        f"[yellow]reference {cfg.reference!r} not among the cameras found; "
+        f"using {names[0]!r}[/yellow]"
+    )
+    return names[0]
+
+
+def _load_rig_calibration(cfg, sizes: dict[str, tuple[int, int]], reference: Optional[str] = None):
     """Load calibration, falling back to a rough guess so the rig still runs."""
     from .geometry import CameraModel, RigCalibration
 
+    reference = reference or cfg.reference
     if cfg.rig_path.exists():
         rig = RigCalibration.load(cfg.rig_path)
         console.print(f"loaded rig calibration from {cfg.rig_path}")
@@ -402,7 +487,7 @@ def _load_rig_calibration(cfg, sizes: dict[str, tuple[int, int]]):
             calibrated = False
             hfov = 100.0 if name == "insta360" else 68.0
             cameras[name] = CameraModel.guess(name, w, h, hfov_deg=hfov)
-    rig = RigCalibration(reference=cfg.reference, cameras=cameras)
+    rig = RigCalibration(reference=reference, cameras=cameras)
     if not calibrated:
         console.print(
             "[yellow]Running with guessed intrinsics — geometry will be approximate. "
@@ -414,6 +499,7 @@ def _load_rig_calibration(cfg, sizes: dict[str, tuple[int, int]]):
 @app.command()
 def live(
     config: Optional[Path] = _CONFIG_OPT,
+    all_cameras: bool = _ALL_OPT,
     mode: str = typer.Option("mono", "--mode", help="mono | stereo | both"),
     stride: int = typer.Option(3, "--stride", help="Pixel stride when lifting depth"),
     show_points: bool = typer.Option(True, "--points/--no-points"),
@@ -429,13 +515,13 @@ def live(
     from .viz.rerun_viz import RerunViz, height_colors
 
     cfg = _load_config(config)
-    res = _resolve_rig(cfg)
+    res = _resolve_rig(cfg, discover=all_cameras)
     rig_cams = CameraRig(res.resolved, cfg.capture)
 
     with rig_cams:
         sizes = rig_cams.sizes()
         console.print(f"cameras: {sizes}")
-        rig_calib, _ = _load_rig_calibration(cfg, sizes)
+        rig_calib, _ = _load_rig_calibration(cfg, sizes, _effective_reference(cfg, sizes))
 
         grid = OccupancyGrid(cfg.grid)
         console.print(
@@ -503,6 +589,7 @@ def live(
 @app.command()
 def watch(
     config: Optional[Path] = _CONFIG_OPT,
+    all_cameras: bool = _ALL_OPT,
     alert_m: Optional[float] = typer.Option(None, "--alert", help="Tint anything closer than this, in metres"),
     stride: int = typer.Option(3, "--stride", help="Pixel stride when lifting depth"),
     carve_stride: int = typer.Option(4, "--carve-stride"),
@@ -530,7 +617,7 @@ def watch(
     from .overlay import caption, render_inference_view
 
     cfg = _load_config(config)
-    res = _resolve_rig(cfg)
+    res = _resolve_rig(cfg, discover=all_cameras)
     for name, dev in res.resolved.items():
         console.print(f"  {name} -> {dev}")
 
@@ -538,21 +625,22 @@ def watch(
     with rig_cams:
         sizes = rig_cams.sizes()
         console.print(f"sizes : {sizes}")
-        rig_calib, calibrated = _load_rig_calibration(cfg, sizes)
+        reference = _effective_reference(cfg, sizes)
+        rig_calib, calibrated = _load_rig_calibration(cfg, sizes, reference)
 
         # Without solved extrinsics every camera sits at the identity, so fusing
         # them all would stack unrelated clouds on top of each other and claim
         # they agree. Fuse only the reference camera until `calib stereo` runs.
         has_extrinsics = cfg.rig_path.exists() and any(
-            np.any(rig_calib.T_rig_cam(n)[:3, 3]) for n in sizes if n != cfg.reference
+            np.any(rig_calib.T_rig_cam(n)[:3, 3]) for n in sizes if n != reference
         )
-        fuse_from = list(sizes) if has_extrinsics else [cfg.reference]
+        fuse_from = list(sizes) if has_extrinsics else [reference]
         bev_note = "" if has_extrinsics else "single-camera (no extrinsics)"
         if not has_extrinsics:
             console.print(
                 "[yellow]No rig extrinsics — the occupancy map is built from "
-                f"'{cfg.reference}' alone. Both depth panels are still live. "
-                "Run `occnet calib stereo` to fuse both.[/yellow]"
+                f"'{reference}' alone. Every depth panel is still live. "
+                "Run `occnet calib stereo` to fuse them.[/yellow]"
             )
 
         depth_model = MonoDepth(cfg.mono)
@@ -565,10 +653,10 @@ def watch(
             if first is None:
                 console.print("[red]no frames from the rig[/red]")
                 raise typer.Exit(1)
-            ref_cam = rig_calib.cameras[cfg.reference]
+            ref_cam = rig_calib.cameras[reference]
             try:
                 lo, hi, voxel = fit_bounds(
-                    depth_model(first[cfg.reference].image), ref_cam.hfov_deg, ref_cam.vfov_deg
+                    depth_model(first[reference].image), ref_cam.hfov_deg, ref_cam.vfov_deg
                 )
                 grid_cfg = GridConfig(**{
                     **asdict(grid_cfg),

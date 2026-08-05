@@ -74,6 +74,27 @@ uv run occnet preview
 `preview` opens both cameras side by side with live FPS and inter-camera skew.
 `q` quits, `s` saves a snapshot pair.
 
+### Picking cameras
+
+You do not have to name them. `--all` (or `cameras: all` in a config) scans at
+startup and uses every camera it finds:
+
+```bash
+uv run occnet watch --all
+uv run occnet watch -c configs/rig-all.yaml
+```
+
+This is usually the better choice on macOS, because **AVFoundation reorders its
+device list at runtime**. Connecting an iPhone as a Continuity Camera can move
+the built-in camera from index 0 to index 1, so any index written into a config
+goes stale — and you silently open the wrong camera. Roles (`builtin`,
+`iphone`, `insta360`) are matched against a fresh scan every run, and the
+`ffmpeg` backend addresses devices by name rather than index.
+
+`occnet doctor` opens every configured camera **at once** and reports each
+camera's frame rate and mean image level, which distinguishes "no frames" from
+"frames arriving, but black".
+
 ### Seeing inference without a camera
 
 `occnet play` runs the same depth and occupancy stack over a video file, so it
