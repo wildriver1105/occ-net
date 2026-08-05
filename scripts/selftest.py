@@ -284,8 +284,89 @@ def test_overlay() -> None:
     check("inference view is not blank", int(canvas.max()) > 0 and float(canvas.std()) > 5)
 
 
+def test_tracking(spec: BoardSpec) -> None:
+    print("\n[5] board pose tracking")
+    from occnet.tracking import BoardTracker, TrackingConfig, ViewpointCoverage
+
+    cam = truth_camera("v", fx=900.0)
+    tracker = BoardTracker(spec, TrackingConfig(), center_origin=True)
+    coverage = ViewpointCoverage()
+
+    pos_errs, rot_errs = [], []
+    for rx, ry, tz in [(0.4, 0.0, 0.55), (-0.4, 0.1, 0.65), (0.0, 0.45, 0.6),
+                       (0.3, -0.35, 0.7), (0.5, 0.2, 0.5)]:
+        T_cam_board = rt_to_matrix(np.array([rx, ry, 0.05]), np.array([-0.11, -0.16, tz]))
+        result = tracker.track(render_board(spec, cam, T_cam_board), cam)
+        if result is None:
+            continue
+        T_true = tracker.T_world_board @ invert(T_cam_board)
+        pos_errs.append(np.linalg.norm(result.T_world_cam[:3, 3] - T_true[:3, 3]) * 1000)
+        R = result.T_world_cam[:3, :3].T @ T_true[:3, :3]
+        rot_errs.append(np.degrees(np.arccos(np.clip((np.trace(R) - 1) / 2, -1, 1))))
+        coverage.add(result.T_world_cam)
+
+    check("tracked every view", len(pos_errs) == 5, f"{len(pos_errs)}/5")
+    if pos_errs:
+        check("camera position within 5 mm", float(np.median(pos_errs)) < 5.0,
+              f"{np.median(pos_errs):.2f} mm median")
+        check("camera rotation within 0.5 deg", float(np.median(rot_errs)) < 0.5,
+              f"{np.median(rot_errs):.3f} deg median")
+    check("viewpoint coverage counts distinct directions", coverage.count >= 3,
+          f"{coverage.count} bins")
+
+    # A blank frame has no board, and must report loss rather than inventing one.
+    blank = tracker.track(np.full((720, 1280, 3), 120, np.uint8), cam)
+    check("reports loss on a frame with no board", blank is None)
+
+
+def test_multiview() -> None:
+    print("\n[6] multi-view accumulation in a world frame")
+    from occnet.fusion.grid import fit_bounds  # noqa: F401  (import guard)
+
+    cam = CameraModel.guess("virt", 640, 360, hfov_deg=80.0)
+    grid = OccupancyGrid(
+        GridConfig(
+            voxel_size=0.05, bounds_min=(-2.5, -2.0, 0.0), bounds_max=(2.5, 2.0, 3.5),
+            device="cpu", carve_stride=2,
+        )
+    )
+
+    # The same world observed from three camera poses. If pose handling is
+    # right the surfaces land on top of each other; if a transform is inverted
+    # or applied twice, they scatter and the slab smears.
+    poses = [
+        np.eye(4),
+        rt_to_matrix(np.array([0.0, 0.30, 0.0]), np.array([-0.5, 0.0, 0.0])),
+        rt_to_matrix(np.array([0.0, -0.30, 0.0]), np.array([0.5, 0.0, 0.0])),
+    ]
+    for T_world_cam in poses:
+        depth = synthetic_room(cam, T_world_cam)
+        pts, _ = lift_depth(depth, cam, None, stride=3, max_depth_m=6.0)
+        grid.integrate(transform_points(T_world_cam, pts).astype(np.float32), T_world_cam[:3, 3])
+
+    occ = grid.occupied_points()
+    check("accumulated occupancy from three poses", len(occ) > 1000, f"{len(occ)} voxels")
+
+    # The slab face is a world plane at z = 1.6 regardless of viewpoint.
+    axis = occ[(np.abs(occ[:, 0]) < 0.2) & (np.abs(occ[:, 1]) < 0.2)]
+    if len(axis):
+        z_med = float(np.median(axis[:, 2]))
+        spread = float(np.percentile(axis[:, 2], 90) - np.percentile(axis[:, 2], 10))
+        check("slab stays at the right world depth", abs(z_med - 1.6) < 0.15, f"median z {z_med:.3f} m")
+        check("surfaces do not smear across views", spread < 0.5, f"10-90 spread {spread:.3f} m")
+    else:
+        check("slab stays at the right world depth", False, "no voxels on the axis")
+
+    # BEV must follow the chosen up axis.
+    bev_y = grid.bev(up_axis=1)
+    bev_z = grid.bev(up_axis=2)
+    check("bev honours up_axis=1", bev_y.shape == (grid.shape[2], grid.shape[0]), f"{bev_y.shape}")
+    check("bev honours up_axis=2", bev_z.shape == (grid.shape[1], grid.shape[0]), f"{bev_z.shape}")
+    check("bev_axes matches the projection", grid.bev_axes(2) == (0, 1))
+
+
 def test_stereo_setup() -> None:
-    print("\n[5] stereo pair ordering and guardrails")
+    print("\n[7] stereo pair ordering and guardrails")
     from occnet.depth.stereo import StereoDepth, order_stereo_pair
     from occnet.geometry import RigCalibration
     from occnet.pipeline import Reconstructor
@@ -324,7 +405,7 @@ def test_stereo_setup() -> None:
 
 
 def test_config() -> None:
-    print("\n[6] configuration round-trip")
+    print("\n[8] configuration round-trip")
     import tempfile
 
     for name in ("configs/rig.yaml", "configs/rig-builtin.yaml"):
@@ -350,6 +431,8 @@ def main() -> int:
         test_extrinsics(spec, truth)
     test_fusion()
     test_overlay()
+    test_tracking(spec)
+    test_multiview()
     test_stereo_setup()
     test_config()
 

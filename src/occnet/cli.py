@@ -852,6 +852,215 @@ def watch(
 
 
 @app.command()
+def scan(
+    config: Optional[Path] = _CONFIG_OPT,
+    all_cameras: bool = _ALL_OPT,
+    only: Optional[str] = _ONLY_OPT,
+    stride: int = typer.Option(3, "--stride", help="Pixel stride when lifting depth"),
+    carve_stride: int = typer.Option(4, "--carve-stride"),
+    row_height: int = typer.Option(320, "--row-height"),
+    extent_m: float = typer.Option(2.0, "--extent", help="Half-width of the scan volume, in metres"),
+    ceiling_m: float = typer.Option(2.0, "--ceiling", help="Scan volume height above the board, in metres"),
+    voxel: float = typer.Option(0.03, "--voxel", help="Voxel size in metres"),
+    out: Path = typer.Option(Path("out/scan"), "--out", "-o", help="Output prefix"),
+) -> None:
+    """Walk a camera around a ChArUco board and accumulate a 3D model.
+
+    The printed board is the world anchor: every frame that sees it yields an
+    absolute camera pose, so observations from different viewpoints land in one
+    consistent volume instead of overwriting each other. Put the board flat in
+    the middle of what you want to capture, then move around it.
+
+    Frames where the board is not visible are skipped — a frame integrated at a
+    guessed pose writes confident geometry into the wrong place, and log-odds
+    evidence is expensive to undo.
+    """
+    import cv2
+    import numpy as np
+
+    from .capture import CameraRig
+    from .depth.mono import MonoDepth
+    from .fusion.grid import GridConfig, OccupancyGrid
+    from .fusion.lift import lift_depth
+    from .geometry import transform_points
+    from .overlay import bev_panel, caption, depth_panel, stack_panels
+    from .tracking import BoardTracker, TrackingConfig, ViewpointCoverage
+
+    cfg = _load_config(config)
+    res = _resolve_rig(cfg, discover=all_cameras, only_names=only)
+    for name, dev in res.resolved.items():
+        console.print(f"  {name} -> {dev}")
+
+    rig_cams = CameraRig(res.resolved, cfg.capture)
+    with rig_cams:
+        sizes = rig_cams.sizes()
+        reference = _effective_reference(cfg, sizes)
+        rig_calib, calibrated = _load_rig_calibration(cfg, sizes, reference)
+        if not calibrated:
+            console.print(
+                "[yellow]Uncalibrated: board poses come from guessed intrinsics, so the "
+                "scan will be geometrically self-consistent but not to scale. "
+                "Run `occnet calib intrinsics` for a metric model.[/yellow]"
+            )
+
+        # World is the board frame, recentred: x/y span the board plane, +z
+        # rises out of the printed face. Lay the board flat and z is up.
+        grid_cfg = GridConfig(**{
+            **asdict(cfg.grid),
+            "voxel_size": voxel,
+            "bounds_min": (-extent_m, -extent_m, -0.05),
+            "bounds_max": (extent_m, extent_m, ceiling_m),
+            "carve_stride": carve_stride,
+            "up_axis": 2,
+            "max_ray_m": float(np.sqrt(8 * extent_m ** 2 + ceiling_m ** 2)),
+        })
+        grid = OccupancyGrid(grid_cfg)
+        console.print(
+            f"volume: {2 * extent_m:.1f} x {2 * extent_m:.1f} x {ceiling_m:.1f} m @ "
+            f"{voxel * 100:.1f} cm ({grid.n_voxels / 1e6:.2f} M voxels) on {grid.device}"
+        )
+        console.print(f"board : {cfg.board.squares_x}x{cfg.board.squares_y}, square {cfg.board.square_m * 1000:.1f} mm")
+
+        trackers = {n: BoardTracker(cfg.board, TrackingConfig()) for n in sizes}
+        coverage = ViewpointCoverage()
+        depth_model = MonoDepth(cfg.mono)
+        console.print(f"model : {depth_model.repo}")
+        depth_model.load()
+
+        window = "occnet — scan"
+        cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+        console.print(
+            "\n[bold]Put the board flat in the middle of the scene, then walk the camera "
+            "around it[/bold] — vary height and angle, not just azimuth.\n"
+            "[dim]q finish and export · r reset the volume[/dim]"
+        )
+
+        n = 0
+        integrated = 0
+        ms_ema = 0.0
+        try:
+            while True:
+                frames = rig_cams.read(timeout=5.0)
+                if frames is None:
+                    console.print("[yellow]camera stalled[/yellow]")
+                    break
+
+                t0 = time.perf_counter()
+                rows: list[np.ndarray] = []
+                any_pose = False
+                for name in sizes:
+                    frame = frames[name]
+                    cam = rig_calib.cameras[name]
+                    track = trackers[name].track(frame.image, cam)
+
+                    rgb = frame.image if track is None else trackers[name].draw(frame.image, track, cam)
+                    status = (
+                        f"LOST  lock {trackers[name].lock_rate * 100:.0f}%"
+                        if track is None else
+                        f"TRACKING  {track.n_corners} corners  {track.reproj_px:.2f} px  "
+                        f"{track.distance_to_board:.2f} m"
+                    )
+                    caption(rgb, [name, status],
+                            colour=(0, 165, 255) if track is None else (0, 255, 0))
+
+                    depth = depth_model(frame.image)
+                    dpanel = depth_panel(depth, max_depth=ceiling_m + extent_m)
+                    caption(dpanel, ["depth  red=near  blue=far"])
+                    rows.append(stack_panels([rgb, dpanel], row_height))
+
+                    if track is None:
+                        continue
+                    any_pose = True
+                    pts, _ = lift_depth(
+                        depth, cam, None, stride=stride,
+                        max_depth_m=cfg.mono.max_depth_m, min_depth_m=cfg.mono.min_depth_m,
+                    )
+                    if len(pts) == 0:
+                        continue
+                    T = track.T_world_cam
+                    grid.integrate(transform_points(T, pts).astype(np.float32), T[:3, 3])
+                    coverage.add(T)
+                    integrated += 1
+
+                elapsed = (time.perf_counter() - t0) * 1000
+                ms_ema = elapsed if not ms_ema else 0.9 * ms_ema + 0.1 * elapsed
+
+                width = max(r.shape[1] for r in rows)
+                left = np.vstack([
+                    r if r.shape[1] == width else np.pad(r, ((0, 0), (0, width - r.shape[1]), (0, 0)))
+                    for r in rows
+                ])
+                col_axis, row_axis = grid.bev_axes()
+                bpanel = bev_panel(
+                    grid.bev(), voxel,
+                    (grid_cfg.bounds_min[col_axis], grid_cfg.bounds_min[row_axis]),
+                    size=(left.shape[0], left.shape[0]),
+                    sensor_x=0.0,
+                    rings_m=(extent_m * 0.5, extent_m),
+                )
+                caption(bpanel, ["BEV — world, board-anchored"], origin=(10, bpanel.shape[0] - 34))
+                canvas = np.hstack([left, bpanel])
+
+                stats = grid.stats()
+                caption(canvas, [
+                    f"{1000 / ms_ema:5.1f} fps   integrated {integrated:5d}   "
+                    f"viewpoints {coverage.count:2d} ({coverage.fraction * 100:3.0f}%)",
+                    f"occupied {int(stats['occupied']):6d}   explored {stats['explored_pct']:4.1f}%   "
+                    f"{'' if any_pose else 'NO POSE — show the board'}",
+                ], origin=(10, canvas.shape[0] - 60))
+
+                cv2.imshow(window, canvas)
+                key = cv2.waitKey(1) & 0xFF
+                if key in (ord("q"), 27):
+                    break
+                if key == ord("r"):
+                    grid.reset()
+                    integrated = 0
+                    console.print("volume reset")
+
+                if n % 30 == 0:
+                    console.print(
+                        f"  frame {n:5d} · {elapsed:6.1f} ms · integrated {integrated:5d} · "
+                        f"viewpoints {coverage.count} · occupied {int(stats['occupied']):6d}"
+                    )
+                n += 1
+        except KeyboardInterrupt:
+            console.print("\nstopping…")
+        finally:
+            cv2.destroyAllWindows()
+            for _ in range(5):
+                cv2.waitKey(1)
+
+    for name, tracker in trackers.items():
+        console.print(
+            f"{name}: locked {tracker.tracked} / {tracker.tracked + tracker.lost} frames "
+            f"({tracker.lock_rate * 100:.0f}%), {tracker.rejected} poses rejected"
+        )
+    if integrated == 0:
+        console.print("[red]Nothing was integrated — the board was never tracked.[/red]")
+        raise typer.Exit(1)
+    if coverage.fraction < 0.25:
+        console.print(
+            f"[yellow]Only {coverage.count} distinct viewing directions were sampled. "
+            "Surfaces seen from one side will have hollow backs.[/yellow]"
+        )
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    grid.save(out.with_suffix(".npz"))
+    console.print(f"[green]saved {out.with_suffix('.npz')}[/green]")
+
+    mesh = grid.extract_mesh()
+    if mesh is None:
+        console.print("[yellow]No surface crossed the occupancy threshold; no mesh written.[/yellow]")
+    else:
+        mesh.export(out.with_suffix(".ply"))
+        console.print(
+            f"[green]{len(mesh.vertices)} verts, {len(mesh.faces)} faces -> "
+            f"{out.with_suffix('.ply')}[/green]"
+        )
+
+
+@app.command()
 def play(
     video: Optional[Path] = typer.Argument(None, help="Video file; omitted renders a synthetic test clip"),
     config: Optional[Path] = _CONFIG_OPT,

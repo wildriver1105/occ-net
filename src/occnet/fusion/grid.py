@@ -51,6 +51,10 @@ class GridConfig:
     # point; free space is highly redundant between neighbouring rays, so this
     # is the cheapest knob when fusion cannot keep up with the cameras.
     carve_stride: int = 1
+    # Which world axis points up, for BEV projection. 1 (y) suits a
+    # camera-anchored frame, where OpenCV's +y points down; 2 (z) suits a
+    # board-anchored world with the board lying flat.
+    up_axis: int = 1
     device: str = "auto"
 
     def __post_init__(self) -> None:
@@ -265,24 +269,37 @@ class OccupancyGrid:
             return np.zeros((0, 3), np.float32)
         return self.voxel_centers(flat).detach().cpu().numpy().astype(np.float32)
 
-    def bev(self, height_range: tuple[float, float] | None = None) -> np.ndarray:
-        """Top-down occupancy map, as a (depth, width) float32 array.
+    def bev_axes(self, up_axis: int | None = None) -> tuple[int, int]:
+        """Which world axes the BEV's columns and rows correspond to."""
+        up = self.cfg.up_axis if up_axis is None else up_axis
+        remaining = [a for a in (0, 1, 2) if a != up]
+        return remaining[0], remaining[1]  # (columns, rows)
+
+    def bev(
+        self,
+        up_axis: int | None = None,
+        height_range: tuple[float, float] | None = None,
+    ) -> np.ndarray:
+        """Top-down occupancy map, as a (rows, cols) float32 array.
 
         Collapses the vertical axis by taking the maximum occupancy probability
         in each column, which is the reading that matters for "can I drive/sail
         through this column of space".
 
-        ``height_range`` restricts the collapse to a slice of the vertical (y)
-        axis in world metres — use it to ignore the floor or the ceiling.
+        ``up_axis`` is which world axis points up. In a camera-anchored frame
+        that is y (OpenCV's +y is down); in a board-anchored world it is z.
+        ``height_range`` restricts the collapse to a slice of that axis, in
+        world metres — use it to ignore the floor or the ceiling.
         """
+        up = self.cfg.up_axis if up_axis is None else up_axis
         vol = self.probability_volume()  # (nx, ny, nz)
         if height_range is not None:
             lo, hi = height_range
-            y0 = int(np.clip((lo - self.origin[1]) / self.cfg.voxel_size, 0, self.dims[1] - 1))
-            y1 = int(np.clip((hi - self.origin[1]) / self.cfg.voxel_size, y0 + 1, self.dims[1]))
-            vol = vol[:, y0:y1, :]
-        # (nx, nz) -> transpose so depth runs down the image and x across it.
-        return vol.max(axis=1).T.astype(np.float32)
+            a0 = int(np.clip((lo - self.origin[up]) / self.cfg.voxel_size, 0, self.dims[up] - 1))
+            a1 = int(np.clip((hi - self.origin[up]) / self.cfg.voxel_size, a0 + 1, self.dims[up]))
+            vol = vol.take(indices=range(a0, a1), axis=up)
+        # Transpose so the second remaining axis runs down the image.
+        return vol.max(axis=up).T.astype(np.float32)
 
     def stats(self) -> dict[str, float]:
         lo = self.log_odds.cpu() if self.log_odds.device.type == "mps" else self.log_odds

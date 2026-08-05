@@ -214,6 +214,37 @@ Three modes:
 `mono` is the one to start with — it runs before you have extrinsics and it
 tolerates the two cameras pointing in different directions.
 
+### Step 2b — scan a space in 3D
+
+`live` and `watch` build the volume in a *fixed* camera frame, so they only ever
+see one viewpoint's worth of geometry. `scan` anchors the world to the printed
+board instead: every frame that sees it yields an absolute camera pose, so you
+can walk the camera around and accumulate.
+
+```bash
+uv run occnet scan --all --only iphone --extent 2.0 --ceiling 2.0 --voxel 0.03
+```
+
+Lay the board flat in the middle of what you want to capture and move around it,
+varying height and angle rather than just circling. The world frame is the board
+frame recentred on its middle, with +z rising out of the printed face — so a
+flat board gives a z-up world, and the BEV is a genuine floor plan.
+
+Frames where the board is not visible are **skipped**, not guessed at. A frame
+integrated at an assumed pose does not blur the map, it writes confident
+geometry into the wrong place, and log-odds evidence is expensive to undo. The
+overlay shows `TRACKING` / `LOST` per camera plus the running lock rate.
+
+Progress is reported as **distinct viewing directions**, not frames: a scan that
+sweeps one wall produces plenty of points while every voxel it filled was seen
+from nearly the same angle, and those surfaces come out hollow-backed.
+
+On exit it writes `out/scan.npz` and `out/scan.ply`.
+
+Measured on synthetic ground truth: camera position recovered to 0.62 mm and
+rotation to 0.05°, with surfaces from three viewpoints landing within 3 voxels
+of each other.
+
 ### Step 3 — export
 
 ```bash
@@ -264,6 +295,7 @@ src/occnet/
   devices.py      AVFoundation enumeration (ffmpeg-backed), role matching
   capture.py      Threaded multi-camera capture, OpenCV + ffmpeg backends
   viewer.py       Live side-by-side window, reused by the calibration flows
+  tracking.py     Board-anchored camera pose, viewpoint coverage
   video.py        Video-file input and the synthetic test clip
   overlay.py      Inference panels: depth colormap, near-field alert, BEV
   geometry.py     CameraModel, RigCalibration, transform helpers
