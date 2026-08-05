@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# uv / virtualenv (uv.lock IS committed, for reproducible installs)
+.venv/
+
+# Generated artefacts: calibration results, recorded sessions, exports.
+# These are outputs of a specific physical rig, not source.
+out/
+data/calib/
+data/calib-builtin/
+data/sessions/
+*.npz
+*.ply
+*.rrd
+
+# Model weights are pulled from Hugging Face on first run
+.cache/
+
+# macOS
+.DS_Store

@@ -1,0 +1,66 @@
+# occnet rig — Insta360 GO 3 + iPhone (Continuity Camera)
+#
+# `cameras` maps a logical name to a device selector. A selector can be:
+#   * a role      : insta360 | iphone | builtin
+#   * a substring : matched against the AVFoundation device name
+#   * an integer  : an explicit AVFoundation device index (see `occnet devices`)
+cameras:
+  insta360: insta360
+  iphone: iphone
+
+# The reference camera defines the rig frame; its pose is the identity.
+# Prefer the wider lens here — it anchors more of the scene.
+reference: insta360
+
+capture:
+  width: 1280
+  height: 720
+  fps: 30.0
+  backend: auto          # auto | opencv | ffmpeg
+  startup_timeout: 12.0
+
+# Printed ChArUco target. MEASURE the printed square with a ruler and put the
+# real value in square_m — every metric distance downstream scales with it.
+board:
+  squares_x: 8
+  squares_y: 11
+  square_m: 0.030
+  marker_m: 0.022
+  dictionary: 5x5_250
+
+# Monocular metric depth (Depth Anything V2).
+mono:
+  model: small           # small | base | large | outdoor-small | rel-small ...
+  device: auto           # auto picks MPS on Apple silicon
+  input_height: 392      # lower = faster, coarser
+  fp16: true
+  min_depth_m: 0.15
+  max_depth_m: 12.0
+
+# Calibrated stereo (only meaningful after `occnet calib stereo`).
+stereo:
+  num_disparities: 128   # must be a multiple of 16
+  block_size: 5
+  uniqueness_ratio: 10
+  wls_filter: true
+  min_depth_m: 0.15
+  max_depth_m: 12.0
+
+# The occupancy volume, in metres, in the reference camera's frame.
+# +x right, +y down, +z forward — so z is distance in front of the camera.
+grid:
+  voxel_size: 0.05
+  bounds_min: [-2.0, -1.5, 0.0]
+  bounds_max: [2.0, 1.5, 4.0]
+  prob_hit: 0.85
+  prob_miss: 0.35
+  clamp_min: -2.5
+  clamp_max: 3.5
+  occupied_threshold: 0.65
+  surface_margin_m: 0.06
+  ray_step_ratio: 0.5
+  carve_stride: 1        # carve free space with every Nth ray; raise to buy frame time
+  max_ray_m: 8.0
+  device: auto
+
+calib_dir: data/calib
